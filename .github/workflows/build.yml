@@ -1,0 +1,217 @@
+name: Build OpenWrt - Xiaomi Mi WiFi 3C
+"on":
+  workflow_dispatch: null
+permissions:
+  contents: read
+concurrency:
+  group: openwrt-mi3c-build
+  cancel-in-progress: false
+env:
+  OPENWRT_RELEASE: 25.12.6
+  BOARD: ramips
+  SUBTARGET: mt76x8
+  PROFILE: xiaomi_miwifi-3c
+  PACKAGES_CUSTOM: luci luci-proto-ppp uhttpd uhttpd-mod-ubus
+  MAX_IMAGE_BYTES: "7733248"
+jobs:
+  build:
+    name: Build Xiaomi Mi WiFi 3C firmware
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      - name: Install ImageBuilder dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends \
+            build-essential \
+            ca-certificates \
+            curl \
+            file \
+            gawk \
+            gettext \
+            git \
+            libncurses-dev \
+            libssl-dev \
+            perl \
+            python3 \
+            rsync \
+            unzip \
+            wget \
+            zlib1g-dev \
+            zstd
+      - name: Download and verify ImageBuilder
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          WORKDIR="${RUNNER_TEMP}/openwrt-imagebuilder"
+          BASE_URL="https://downloads.openwrt.org/releases/${OPENWRT_RELEASE}/targets/${BOARD}/${SUBTARGET}"
+          IB_NAME="openwrt-imagebuilder-${OPENWRT_RELEASE}-${BOARD}-${SUBTARGET}.Linux-x86_64"
+          IB_ARCHIVE="${IB_NAME}.tar.zst"
+
+          mkdir -p "$WORKDIR"
+          cd "$WORKDIR"
+
+          curl --fail --location --retry 5 --retry-all-errors --connect-timeout 30 \
+            "${BASE_URL}/sha256sums" \
+            --output sha256sums
+
+          curl --fail --location --retry 5 --retry-all-errors --connect-timeout 30 \
+            "${BASE_URL}/${IB_ARCHIVE}" \
+            --output "$IB_ARCHIVE"
+
+          EXPECTED_SHA256="$(awk -v file="$IB_ARCHIVE" '{ name=$2; sub(/^\*/, "", name); if (name == file) { print $1; exit } }' sha256sums)"
+
+          if [[ -z "$EXPECTED_SHA256" ]]; then
+            echo "::error::ImageBuilder checksum was not found in sha256sums."
+            exit 1
+          fi
+
+          printf '%s  %s\n' "$EXPECTED_SHA256" "$IB_ARCHIVE" | sha256sum --check -
+
+          tar --zstd --extract --file "$IB_ARCHIVE"
+
+          if [[ ! -f "${WORKDIR}/${IB_NAME}/Makefile" ]]; then
+            echo "::error::ImageBuilder Makefile not found."
+            exit 1
+          fi
+
+          echo "IMAGEBUILDER_DIR=${WORKDIR}/${IB_NAME}" >> "$GITHUB_ENV"
+          echo "ImageBuilder downloaded and checksum-verified."
+      - name: Validate profile, enable default Wi-Fi, and prepare manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$IMAGEBUILDER_DIR"
+
+          mkdir -p files "$GITHUB_WORKSPACE/dist"
+
+          if [[ -d "$GITHUB_WORKSPACE/files" ]]; then
+            cp -a "$GITHUB_WORKSPACE/files/." "$IMAGEBUILDER_DIR/files/"
+          fi
+
+          # Enable the first Wi-Fi radio without changing defaults.
+          mkdir -p files/etc/uci-defaults
+          cat > files/etc/uci-defaults/99-enable-wifi <<'EOF'
+          #!/bin/sh
+          set -e
+
+          if uci -q get 'wireless.@wifi-device[0]' >/dev/null 2>&1; then
+              uci set 'wireless.@wifi-device[0].disabled=0'
+              uci commit wireless
+          fi
+
+          exit 0
+          EOF
+
+          chmod 0755 files/etc/uci-defaults/99-enable-wifi
+
+          make info | tee "$RUNNER_TEMP/openwrt-imagebuilder-info.txt"
+
+          if ! grep -Fq "${PROFILE}:" "$RUNNER_TEMP/openwrt-imagebuilder-info.txt"; then
+            echo "::error::Profile '${PROFILE}' is not listed by this ImageBuilder."
+            exit 1
+          fi
+
+          make manifest \
+            PROFILE="$PROFILE" \
+            PACKAGES="$PACKAGES_CUSTOM" \
+            > "$GITHUB_WORKSPACE/dist/packages-manifest.txt"
+      - name: Build firmware
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$IMAGEBUILDER_DIR"
+
+          make image \
+            PROFILE="$PROFILE" \
+            PACKAGES="$PACKAGES_CUSTOM" \
+            FILES="files"
+
+          IMAGE_DIR="bin/targets/${BOARD}/${SUBTARGET}"
+
+          mapfile -t IMAGES < <(
+            find "$IMAGE_DIR" -maxdepth 1 -type f \
+              -name "*${PROFILE}*squashfs-sysupgrade.bin" \
+              -print
+          )
+
+          if [[ "${#IMAGES[@]}" -ne 1 ]]; then
+            echo "::error::Expected exactly one sysupgrade image; found ${#IMAGES[@]}."
+            find "$IMAGE_DIR" -maxdepth 1 -type f -print || true
+            exit 1
+          fi
+
+          IMAGE_SOURCE="${IMAGES[0]}"
+          IMAGE_SIZE="$(stat --format='%s' "$IMAGE_SOURCE")"
+
+          echo "Firmware: $(basename "$IMAGE_SOURCE")"
+          echo "Size: ${IMAGE_SIZE} bytes"
+
+          if (( IMAGE_SIZE >= MAX_IMAGE_BYTES )); then
+            echo "::error::Image is ${IMAGE_SIZE} bytes; limit is ${MAX_IMAGE_BYTES} bytes."
+            exit 1
+          fi
+
+          # Preserve the original ImageBuilder filename.
+          cp "$IMAGE_SOURCE" "$GITHUB_WORKSPACE/dist/"
+
+          IMAGE_NAME="$(basename "$IMAGE_SOURCE")"
+
+          (
+            cd "$GITHUB_WORKSPACE/dist"
+            sha256sum "$IMAGE_NAME" > SHA256SUMS
+          )
+
+          echo "Image built and passed the size check."
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: openwrt-mi3c-${{ env.OPENWRT_RELEASE }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          IMAGE="$(find dist -maxdepth 1 -type f -name '*-squashfs-sysupgrade.bin' -print -quit)"
+          CHECKSUM="dist/SHA256SUMS"
+          MANIFEST="dist/packages-manifest.txt"
+
+          if [[ -z "$IMAGE" || ! -s "$CHECKSUM" || ! -s "$MANIFEST" ]]; then
+            echo "::error::Release files are incomplete."
+            exit 1
+          fi
+
+          RELEASE_TAG="openwrt-${OPENWRT_RELEASE}-mi3c"
+          RELEASE_TITLE="OpenWrt ${OPENWRT_RELEASE} - Xiaomi Mi WiFi 3C"
+          RELEASE_NOTES="Custom ImageBuilder build for Xiaomi Mi WiFi 3C (ramips/mt76x8, profile: ${PROFILE}). Built from the official OpenWrt ${OPENWRT_RELEASE} ImageBuilder. The sysupgrade image is checked to be smaller than ${MAX_IMAGE_BYTES} bytes. Verify the image with SHA256SUMS before flashing."
+
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # Original filenames; no custom display labels.
+            gh release upload "$RELEASE_TAG" \
+              "$IMAGE" \
+              "$CHECKSUM" \
+              "$MANIFEST" \
+              --clobber \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            # Original filenames; no custom display labels.
+            gh release create "$RELEASE_TAG" \
+              "$IMAGE" \
+              "$CHECKSUM" \
+              "$MANIFEST" \
+              --title "$RELEASE_TITLE" \
+              --notes "$RELEASE_NOTES" \
+              --target "$GITHUB_SHA" \
+              --repo "$GITHUB_REPOSITORY"
+          fi
