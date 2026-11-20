@@ -5,7 +5,7 @@ GitHub Actions workflow to build optimized, custom official OpenWrt firmware ima
 ## Build Specifications
 - **Target Device:** Xiaomi Mi WiFi 3C (`ramips / mt76x8`)
 - **Base Version:** OpenWrt Stable Release (`25.12.6`)
-- **Included Packages:** LuCI base web interface (`luci-base`), Wi-Fi drivers & WISP support (`wpad-basic-mbedtls`, `wireless-tools`), PPPoE modules (`ppp`, `ppp-mod-pppoe`), and IPv6/DHCPv6 stack (`odhcp6c`, `odhcpd-ipv6only`).
+- **Included Packages:** LuCI web interface (`luci`, `luci-base`), SQM/QoS (`luci-app-sqm`), Wi-Fi support (`wpad-basic-mbedtls`, `iw`, `wifi-scripts`), PPPoE modules (`ppp`, `ppp-mod-pppoe`), and IPv6/DHCPv6 stack (`odhcp6c`, `odhcpd-ipv6only`).
 - **Optimizations:** Strictly tuned below the 7.7 MB (`7,733,248 bytes`) safe threshold for direct flashing from OEM stock firmware, with Wi-Fi enabled by default.
 
 ---
@@ -19,11 +19,11 @@ GitHub Actions workflow to build optimized, custom official OpenWrt firmware ima
    dd if=/dev/mtd0 of=/tmp/mtd0
    ```
 
-4. **Upload Firmware:** Transfer the downloaded `openwrt-ramips-mt76x8-xiaomi_miwifi-3c-squashfs-sysupgrade.bin` file to the `/tmp` directory on the router using FTP.
+4. **Upload Firmware:** Transfer the downloaded `.bin` file to the `/tmp` directory on the router using FTP.
 5. **Flash OpenWrt:** Execute the following commands to install OpenWrt onto the primary OS partition:
 
    ```sh
    mtd erase OS1
    mtd erase OS2
-   mtd -r write /tmp/openwrt-ramips-mt76x8-xiaomi_miwifi-3c-squashfs-sysupgrade.bin OS1
+   mtd -r write /tmp/filename.bin OS1
    ```
